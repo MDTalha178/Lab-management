@@ -1,0 +1,465 @@
+# Architecture Documentation
+
+## Overview
+
+This is a multi-tenant laboratory management system built with Django REST Framework, implementing a single-database multi-tenant architecture with complete data isolation.
+
+## System Architecture
+
+### Multi-Tenancy Strategy
+
+**Approach**: Single Database with Tenant Scoping
+
+**Implementation**:
+- All tenant-scoped models inherit from `TenantAwareModel`
+- Tenant resolution happens at middleware level
+- Thread-local storage maintains tenant context throughout request lifecycle
+- Database-level isolation through foreign key relationships and query filtering
+
+**Benefits**:
+- Cost-effective (single database)
+- Simplified backup and maintenance
+- Atomic cross-tenant operations (if needed by superusers)
+- Easier schema migrations
+
+**Trade-offs**:
+- Requires careful implementation to prevent data leakage
+- All queries must include tenant filtering
+- Cannot provide true physical isolation
+
+## Domain Model Design
+
+### Entities and Relationships
+
+```
+Tenant (1) ─────── (N) User
+   │
+   ├─────── (N) Patient
+   │            │
+   │            └─────── (N) Test
+   │                        │
+   │                        ├─────── (1) TestType
+   │                        │
+   │                        └─────── (N) Sample
+   │
+   └─────── (N) TestType
+```
+
+### Core Models
+
+#### 1. Tenant
+**Purpose**: Represents an organization/laboratory
+
+**Key Fields**:
+- `name`: Unique organization name
+- `slug`: URL-friendly identifier
+- `is_active`: Activation status
+- `address`: Full address information
+- `contact_email`, `contact_phone`: Contact details
+- `settings`: JSON field for tenant-specific configurations
+
+**Design Rationale**:
+- Soft-delete pattern (is_active flag) for data retention
+- JSON settings allow flexible tenant customization
+- Unique constraints ensure no naming conflicts
+
+#### 2. User
+**Purpose**: Authentication and authorization
+
+**Key Fields**:
+- `tenant`: FK to Tenant (null for superusers)
+- `email`: Unique login identifier
+- `role`: TENANT_ADMIN or TENANT_USER
+- `address`: Required address information
+- `is_active`: Account status
+
+**Design Rationale**:
+- Email-based authentication (more professional than username)
+- Required address per requirements
+- Role field enables RBAC
+- One user = one tenant (enforced by constraint)
+
+#### 3. Patient
+**Purpose**: Core domain entity representing lab patients
+
+**Key Fields**:
+- `tenant`: FK to Tenant
+- `patient_id`: Unique within tenant
+- `personal_info`: Name, DOB, gender, contact
+- `address`: Full address
+- `medical_info`: Blood group, history, allergies, medications
+- `emergency_contact`: Emergency contact details
+
+**Design Rationale**:
+- `patient_id` unique per tenant (not globally)
+- Comprehensive medical information for lab context
+- Emergency contacts for safety compliance
+- Calculated `age` property for convenience
+
+#### 4. TestType
+**Purpose**: Catalog of available tests per tenant
+
+**Key Fields**:
+- `tenant`: FK to Tenant
+- `code`: Unique identifier within tenant
+- `category`: Grouping (Blood Test, Urine Test, etc.)
+- `price`: Cost information
+- `estimated_duration_hours`: SLA tracking
+- `sample_requirements`: Type, volume needed
+
+**Design Rationale**:
+- Tenants can define custom test types
+- Price tracking for billing integration
+- Sample requirements drive sample collection
+- Normal range stored as string for flexibility
+
+#### 5. Test
+**Purpose**: Represents a test order
+
+**Key Fields**:
+- `tenant`: FK to Tenant
+- `test_number`: Auto-generated unique identifier
+- `patient`: FK to Patient
+- `test_type`: FK to TestType
+- `ordered_by`: FK to User (who ordered)
+- `status`: Workflow state (pending → completed)
+- `priority`: Urgency level
+- `results`: Value, interpretation, abnormal flag
+- `reviewed_by`, `reviewed_at`: Result verification
+
+**Design Rationale**:
+- Status-driven workflow management
+- Priority support for urgent cases
+- Audit trail (who ordered, who reviewed)
+- Results can be abnormal flagged for alerts
+- Auto-generated test numbers prevent conflicts
+
+#### 6. Sample
+**Purpose**: Physical specimens for testing
+
+**Key Fields**:
+- `tenant`: FK to Tenant
+- `sample_id`: Auto-generated unique identifier
+- `test`: FK to Test
+- `sample_type`, `volume_ml`: Physical characteristics
+- `collected_by`, `collected_at`: Collection audit
+- `status`: Lifecycle tracking (collected → processed)
+- `storage_location`, `storage_temperature`: Handling
+- `quality_acceptable`, `rejection_reason`: QC
+- `is_hazardous`: Safety flag
+
+**Design Rationale**:
+- Complete lifecycle tracking from collection to processing
+- Quality control with rejection workflow
+- Storage information for laboratory compliance
+- Hazardous flag for safety protocols
+- Links to test for traceability
+
+### Constraints and Business Rules
+
+1. **Unique Identifiers Per Tenant**:
+   - Patient ID unique within tenant
+   - Test Type code unique within tenant
+   - Test number unique within tenant
+   - Sample ID unique within tenant
+
+2. **Referential Integrity**:
+   - Tests use PROTECT on Patient/TestType (cannot delete if tests exist)
+   - Samples use PROTECT on Test
+   - User uses CASCADE on Tenant (deleting tenant deletes users)
+
+3. **Status Workflows**:
+   - Test: PENDING → SAMPLE_COLLECTED → IN_PROGRESS → COMPLETED
+   - Sample: COLLECTED → IN_TRANSIT → RECEIVED → PROCESSING → PROCESSED
+
+4. **Automatic Behaviors**:
+   - Test numbers auto-generated (T-XXXXXXXX)
+   - Sample IDs auto-generated (S-XXXXXXXX)
+   - Timestamps auto-maintained
+   - Tenant auto-set from middleware context
+
+## Tenant Isolation Mechanism
+
+### Middleware Flow
+
+```
+Request → TenantMiddleware → Resolve Tenant → Set Thread-Local → View → Response
+                                    ↓
+                            Check Authentication
+                                    ↓
+                            Validate Tenant Active
+                                    ↓
+                            Store in request.tenant
+```
+
+### Implementation Details
+
+**TenantMiddleware**:
+1. Extracts tenant from authenticated user
+2. Validates tenant is active
+3. Stores in thread-local storage
+4. Makes available as `request.tenant`
+5. Cleans up after request
+
+**TenantAwareModel**:
+- Base class for all domain models
+- Auto-sets tenant on save from thread-local
+- Raises error if tenant missing
+
+**QuerySet Filtering**:
+```python
+def get_queryset(self):
+    queryset = super().get_queryset()
+    if not self.request.user.is_superuser:
+        return queryset.filter(tenant=self.request.user.tenant)
+    return queryset
+```
+
+### Security Considerations
+
+1. **Middleware Order**: Tenant middleware after authentication
+2. **Excluded Paths**: Login, register, public endpoints bypass tenant check
+3. **Superuser Bypass**: Platform admins can access all tenants
+4. **Object-Level Permission**: `IsSameTenant` validates object ownership
+5. **No Direct Tenant Access**: Users cannot specify tenant in requests
+
+## API Design
+
+### URL Structure
+
+```
+/api/tenants/                    # Tenant management (superusers)
+/api/tenants/register/           # Public tenant registration
+/api/auth/login/                 # Authentication
+/api/auth/refresh/               # Token refresh
+/api/auth/users/                 # User management
+/api/auth/users/me/              # Current user profile
+/api/patients/patients/          # Patient CRUD
+/api/patients/test-types/        # Test type catalog
+/api/patients/tests/             # Test management
+/api/patients/samples/           # Sample tracking
+```
+
+### Authentication
+
+**Method**: JWT (JSON Web Tokens)
+
+**Flow**:
+1. Login with email/password
+2. Receive access token (1 hour) and refresh token (7 days)
+3. Include access token in Authorization header
+4. Refresh before expiration
+
+**Token Contents**:
+```json
+{
+    "user_id": 1,
+    "email": "user@example.com",
+    "role": "tenant_admin",
+    "tenant_id": 1,
+    "exp": 1234567890
+}
+```
+
+### Permission Model
+
+**Levels**:
+1. **IsAuthenticated**: Must be logged in
+2. **IsTenantUser**: Must belong to active tenant
+3. **IsTenantAdmin**: Must have admin role
+4. **IsSameTenant**: Object must belong to user's tenant
+
+**Permission Matrix**:
+
+| Resource | List | Create | Read | Update | Delete |
+|----------|------|--------|------|--------|--------|
+| Users (Admin) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Users (User) | ✓ | ✗ | ✓ | Own | ✗ |
+| Patients | ✓ | ✓ | ✓ | ✓ | Admin |
+| Test Types | ✓ | Admin | ✓ | Admin | Admin |
+| Tests | ✓ | ✓ | ✓ | ✓ | Admin |
+| Samples | ✓ | ✓ | ✓ | ✓ | Admin |
+
+## Data Flow Examples
+
+### Creating a Test
+
+```
+1. User (via UI): POST /api/patients/tests/
+   {
+       "patient": 5,
+       "test_type": 2,
+       "priority": "urgent"
+   }
+
+2. View: Extract tenant from request.user.tenant
+
+3. Validate:
+   - Patient exists and belongs to tenant
+   - Test type exists and belongs to tenant
+   - User has permission
+
+4. Generate test_number: T-A3B5C7D9
+
+5. Save Test with tenant, ordered_by
+
+6. Response: Full test object with relations
+```
+
+### Querying Patients
+
+```
+1. User: GET /api/patients/patients/?gender=female
+
+2. View: Base queryset = Patient.objects.all()
+
+3. Tenant Filter: queryset.filter(tenant=request.user.tenant)
+
+4. Additional Filter: queryset.filter(gender='female')
+
+5. Serialization: Include computed fields (age, test_count)
+
+6. Response: Paginated list of patients
+```
+
+## Assumptions and Design Decisions
+
+### 1. Single Tenant per User
+**Assumption**: Users don't switch between tenants
+**Rationale**: Simplifies access control and UX
+**Alternative**: Multi-tenant users with tenant switching
+
+### 2. Auto-Generated IDs
+**Assumption**: System generates patient_id, test_number, sample_id
+**Rationale**: Prevents collisions, consistent format
+**Alternative**: User-provided IDs with validation
+
+### 3. Soft Deletes for Critical Data
+**Assumption**: Tests and samples should not be hard-deleted
+**Rationale**: Audit trail, regulatory compliance
+**Implementation**: is_active flags or status transitions
+
+### 4. Results Stored as Strings
+**Assumption**: Test results vary widely in format
+**Rationale**: Maximum flexibility, simple implementation
+**Alternative**: Structured result fields per test type
+
+### 5. One Sample per Test
+**Assumption**: Tests can have multiple samples but workflow is 1:N
+**Rationale**: Real lab scenarios may need multiple samples
+**Alternative**: 1:1 relationship
+
+### 6. Middleware-Based Tenant Resolution
+**Assumption**: Tenant determined by user identity
+**Rationale**: Secure, automatic, transparent to views
+**Alternative**: Subdomain-based, header-based resolution
+
+## Scalability Considerations
+
+### Current Architecture Limits
+- Single PostgreSQL database
+- Thread-local storage (not multi-process safe across servers)
+- No caching layer
+
+### Scaling Strategies
+
+**Horizontal Scaling**:
+- Load balancer → Multiple Django app servers
+- Shared PostgreSQL database
+- Thread-local works per process
+
+**Database Scaling**:
+- Read replicas for queries
+- Connection pooling (pgBouncer)
+- Partition large tables by tenant_id
+
+**Caching**:
+- Redis for session storage
+- Cache test types (rarely change)
+- Cache tenant settings
+
+**Future Enhancements**:
+- Separate databases per tenant (true isolation)
+- Elasticsearch for patient/test search
+- Async task queue (Celery) for long-running operations
+- S3 for storing test result files/images
+
+## Testing Strategy
+
+**Unit Tests**:
+- Model methods and properties
+- Serializer validation
+- Utility functions
+
+**Integration Tests**:
+- API endpoints with authentication
+- Tenant isolation verification
+- Permission checks
+
+**Test Tenant Isolation**:
+```python
+def test_users_cannot_see_other_tenant_data():
+    tenant1 = create_tenant("Lab A")
+    tenant2 = create_tenant("Lab B")
+    user1 = create_user(tenant1)
+    patient2 = create_patient(tenant2)
+
+    response = api_client.force_authenticate(user1).get('/api/patients/patients/')
+    assert patient2 not in response.data
+```
+
+## Security Hardening
+
+1. **SQL Injection**: Django ORM prevents
+2. **XSS**: Django templates auto-escape
+3. **CSRF**: Django CSRF middleware
+4. **Clickjacking**: X-Frame-Options header
+5. **HTTPS**: Force SSL in production
+6. **Password**: PBKDF2 hashing, validation
+7. **Rate Limiting**: Throttle classes
+8. **Secrets**: Environment variables
+9. **CORS**: Whitelist origins
+10. **Logging**: Audit trail for sensitive operations
+
+## Deployment Architecture
+
+```
+Internet
+    ↓
+Load Balancer (HTTPS)
+    ↓
+[Django App Server 1] [Django App Server 2] [Django App Server N]
+    ↓
+PostgreSQL Database
+    ↓
+[Backup Storage]
+```
+
+**Components**:
+- **Load Balancer**: Nginx/AWS ALB
+- **App Servers**: Gunicorn + Django
+- **Database**: PostgreSQL with replication
+- **Static Files**: WhiteNoise or S3
+- **Monitoring**: Sentry, CloudWatch
+- **Logs**: Centralized logging (ELK Stack)
+
+## Maintenance and Monitoring
+
+**Health Checks**:
+- Database connectivity
+- Disk space
+- Memory usage
+- Active tenant count
+
+**Monitoring Metrics**:
+- Request latency by endpoint
+- Error rate by tenant
+- Database query performance
+- Active users per tenant
+
+**Backup Strategy**:
+- Daily full database backup
+- Point-in-time recovery enabled
+- Test restoration monthly
+
+This architecture provides a solid foundation for a production multi-tenant laboratory management system with room for growth and enhancement.
